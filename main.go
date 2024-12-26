@@ -17,8 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/schollz/progressbar/v3"
-	log "github.com/sirupsen/logrus"
 	"github.com/yapingcat/gomedia/go-mp4"
 )
 
@@ -58,22 +59,17 @@ type PlaylistResponse struct {
 	Audio   []AudioStream `json:"audio"`
 }
 
-// Vimeo holds our main data, including the final playlist JSON.
 type Vimeo struct {
 	playlistURL string
 	outputPath  string
 	response    *PlaylistResponse
 	mainBase    string
-	concurrency int // user-specified number of threads
+	concurrency int
 }
-
-// -----------------------------------------------------------------------------
-// 1) Code to get the final playlistURL from a Vimeo video id:hash if no direct URL
-// -----------------------------------------------------------------------------
 
 // fetchVimeoJWT calls https://vimeo.com/_next/jwt to obtain a JWT token.
 func fetchVimeoJWT(ctx context.Context) (string, error) {
-	log.Debug("Starting fetchVimeoJWT() ...")
+	log.Debug().Msg("Starting fetchVimeoJWT() ...")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://vimeo.com/_next/jwt", nil)
 	if err != nil {
@@ -82,16 +78,16 @@ func fetchVimeoJWT(ctx context.Context) (string, error) {
 
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
-	log.Debug("Sending request to https://vimeo.com/_next/jwt")
+	log.Debug().Msg("Sending request to https://vimeo.com/_next/jwt")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.WithError(err).Error("Failed to request JWT")
+		log.Error().Err(err).Msg("Failed to request JWT")
 		return "", fmt.Errorf("failed to request JWT: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.WithField("status_code", resp.StatusCode).Error("Unexpected HTTP status for JWT")
+		log.Error().Int("status_code", resp.StatusCode).Msg("Unexpected HTTP status for JWT")
 		return "", fmt.Errorf("unexpected HTTP status for JWT: %d", resp.StatusCode)
 	}
 
@@ -99,23 +95,23 @@ func fetchVimeoJWT(ctx context.Context) (string, error) {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		log.WithError(err).Error("Failed to parse JWT JSON")
+		log.Error().Err(err).Msg("Failed to parse JWT JSON")
 		return "", fmt.Errorf("failed to parse JWT JSON: %w", err)
 	}
 	if data.Token == "" {
-		log.Error("JWT token not found in response")
+		log.Error().Msg("JWT token not found in response")
 		return "", errors.New("JWT token not found in response")
 	}
 
-	log.WithField("token_prefix", data.Token[:15]).Debug("Successfully fetched JWT")
+	log.Debug().Str("token_prefix", data.Token[:15]).Msg("Successfully fetched JWT")
 	return data.Token, nil
 }
 
-// fetchVimeoConfigURL gets the config_url from https://api.vimeo.com/videos/<video_id>?fields=config_url
-// If you have a hash, use "video_id:hash" as <video_id>.
+// fetchVimeoConfigURL gets the config_url from https://api.vimeo.com/videos/<video_id>
+
 func fetchVimeoConfigURL(ctx context.Context, videoID, jwt string) (string, error) {
 	apiURL := fmt.Sprintf("https://api.vimeo.com/videos/%s?fields=config_url", videoID)
-	log.Debugf("fetchVimeoConfigURL => %s", apiURL)
+	log.Debug().Str("url", apiURL).Msg("fetchVimeoConfigURL")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
@@ -123,7 +119,7 @@ func fetchVimeoConfigURL(ctx context.Context, videoID, jwt string) (string, erro
 	}
 	req.Header.Set("Authorization", "jwt "+jwt)
 
-	log.Debug("Sending request to get config_url ...")
+	log.Debug().Msg("Sending request to get config_url ...")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to request config_url: %w", err)
@@ -144,20 +140,20 @@ func fetchVimeoConfigURL(ctx context.Context, videoID, jwt string) (string, erro
 		return "", errors.New("config_url not found in response")
 	}
 
-	log.Debugf("Received config_url => %s", data.ConfigURL)
+	log.Debug().Str("config_url", data.ConfigURL).Msg("Received config_url")
 	return data.ConfigURL, nil
 }
 
 // fetchAVCPlaylistURL calls the config_url to get the "request.files.dash.cdns.<default_cdn>.avc_url"
 func fetchAVCPlaylistURL(ctx context.Context, configURL string) (string, error) {
-	log.Debugf("fetchAVCPlaylistURL => configURL: %s", configURL)
+	log.Debug().Str("configURL", configURL).Msg("fetchAVCPlaylistURL")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to build configURL request: %w", err)
 	}
 
-	log.Debug("Sending request to configURL for AVC ...")
+	log.Debug().Msg("Sending request to configURL for AVC ...")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to request configURL: %w", err)
@@ -196,35 +192,28 @@ func fetchAVCPlaylistURL(ctx context.Context, configURL string) (string, error) 
 		return "", errors.New("avc_url not found in config")
 	}
 
-	log.Debugf("avc_url => %s", cdn.AVCURL)
+	log.Debug().Str("avc_url", cdn.AVCURL).Msg("Received AVC URL")
 	return cdn.AVCURL, nil
 }
 
-// resolvePlaylistURLFromVideoID does the entire chain:
-//  1. fetch JWT
-//  2. fetch config_url
-//  3. fetch avc_url
-//
-// Returns final .json playlist URL or error.
+// resolvePlaylistURLFromVideoID resolves the final playlist URL
+
 func resolvePlaylistURLFromVideoID(videoID string) (string, error) {
-	log.Debugf("resolvePlaylistURLFromVideoID => videoID: %s", videoID)
+	log.Debug().Str("videoID", videoID).Msg("resolvePlaylistURLFromVideoID")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// 1) JWT
 	jwt, err := fetchVimeoJWT(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch Vimeo JWT: %w", err)
 	}
 
-	// 2) config_url
 	configURL, err := fetchVimeoConfigURL(ctx, videoID, jwt)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch config_url: %w", err)
 	}
 
-	// 3) avc_url
 	avcURL, err := fetchAVCPlaylistURL(ctx, configURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch avc_url: %w", err)
@@ -233,12 +222,8 @@ func resolvePlaylistURLFromVideoID(videoID string) (string, error) {
 	return avcURL, nil
 }
 
-// -----------------------------------------------------------------------------
-// 2) Fetch and parse the final playlist JSON
-// -----------------------------------------------------------------------------
-
 func (v *Vimeo) SendRequest() error {
-	log.Debugf("SendRequest => fetching playlist from: %s", v.playlistURL)
+	log.Debug().Str("url", v.playlistURL).Msg("Fetching playlist")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -258,77 +243,81 @@ func (v *Vimeo) SendRequest() error {
 		return fmt.Errorf("unexpected status code: %d for playlist JSON", resp.StatusCode)
 	}
 
-	// Decode JSON directly from the response body
 	var pr PlaylistResponse
 	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
 		return fmt.Errorf("failed to decode playlist JSON: %w", err)
 	}
 
 	v.response = &pr
-	log.Infof("Playlist JSON successfully retrieved. ClipID: %s, BaseURL: %s", pr.ClipID, pr.BaseURL)
+	log.Info().
+		Str("clipID", pr.ClipID).
+		Str("baseURL", pr.BaseURL).
+		Msg("Playlist JSON successfully retrieved")
 	return nil
 }
 
-// ParsePlaylist sets up v.mainBase and sorts video/audio streams to easily find best streams.
 func (v *Vimeo) ParsePlaylist() error {
 	if v.response == nil {
 		return errors.New("no response data available")
 	}
 
-	log.Debug("Sorting video streams by descending bitrate ...")
-	// Sort video streams by (bitrate or avg_bitrate) descending
+	log.Debug().Msg("Sorting video streams by descending bitrate")
+
 	sort.Slice(v.response.Video, func(i, j int) bool {
 		return v.response.Video[i].Bitrate > v.response.Video[j].Bitrate
 	})
 
-	log.Debug("Sorting audio streams by descending bitrate ...")
-	// Sort audio streams by bitrate descending
+	log.Debug().Msg("Sorting audio streams by descending bitrate")
+
 	sort.Slice(v.response.Audio, func(i, j int) bool {
 		return v.response.Audio[i].Bitrate > v.response.Audio[j].Bitrate
 	})
 
 	baseURL, err := url.Parse(v.playlistURL)
 	if err != nil {
-		log.WithError(err).Error("Failed to parse playlist URL")
+		log.Error().Err(err).Msg("Failed to parse playlist URL")
 		return fmt.Errorf("failed to parse playlistURL: %w", err)
 	}
 	ref, err := url.Parse(v.response.BaseURL)
 	if err != nil {
-		log.WithError(err).Error("Failed to parse response base URL")
+		log.Error().Err(err).Msg("Failed to parse response base URL")
 		return fmt.Errorf("failed to parse response.BaseURL: %w", err)
 	}
 	resolved := baseURL.ResolveReference(ref).String()
 	v.mainBase = resolved
 
-	log.WithField("main_base", v.mainBase).Debug("Base URL resolved successfully")
+	log.Debug().Str("main_base", v.mainBase).Msg("Base URL resolved successfully")
 
-	//log.Debugf("Set v.mainBase => %s", v.mainBase)
 	return nil
 }
 
-// BestVideoStream returns the first (best) video stream after sorting.
 func (v *Vimeo) BestVideoStream() *VideoStream {
 	if len(v.response.Video) == 0 {
 		return nil
 	}
 	best := &v.response.Video[0]
-	log.Debugf("Best video => ID:%s, resolution:%dx%d, bitrate:%d",
-		best.ID, best.Width, best.Height, best.Bitrate)
+	log.Debug().
+		Str("id", best.ID).
+		Int("width", best.Width).
+		Int("height", best.Height).
+		Int("bitrate", best.Bitrate).
+		Msg("Best video stream selected")
 	return best
 }
 
-// BestAudioStream returns the first (best) audio stream after sorting.
 func (v *Vimeo) BestAudioStream() *AudioStream {
 	if len(v.response.Audio) == 0 {
 		return nil
 	}
 	best := &v.response.Audio[0]
-	log.Debugf("Best audio => ID:%s, channels:%d, bitrate:%d",
-		best.ID, best.Channels, best.Bitrate)
+	log.Debug().
+		Str("id", best.ID).
+		Int("channels", best.Channels).
+		Int("bitrate", best.Bitrate).
+		Msg("Best audio stream selected")
 	return best
 }
 
-// buildSegmentURL resolves the segment URL relative to the base.
 func buildSegmentURL(base, segURL string) (string, error) {
 	segBase, err := url.Parse(base)
 	if err != nil {
@@ -341,14 +330,6 @@ func buildSegmentURL(base, segURL string) (string, error) {
 	return segBase.ResolveReference(ref).String(), nil
 }
 
-// -----------------------------------------------------------------------------
-// 4) Concurrency: download segments, store them in memory, then write in order
-// -----------------------------------------------------------------------------
-
-// downloadSegments concurrently downloads all segments in the correct order:
-//  1. decode and write initSegment
-//  2. download all segments in parallel (or sequential if concurrency=1)
-//  3. write out segments in ascending index
 func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outputFileName string) error {
 	if len(segmentList) == 0 {
 		return fmt.Errorf("segmentList is empty, cannot download => %s", outputFileName)
@@ -361,36 +342,40 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 	}
 	defer f.Close()
 
-	// 1) Write the init segment
 	initData, err := base64.StdEncoding.DecodeString(initBase64)
 	if err != nil {
 		return fmt.Errorf("failed to decode init segment: %w", err)
 	}
-	log.Debugf("Writing init segment of length %d to => %s", len(initData), outputFileName)
+	log.Debug().
+		Int("length", len(initData)).
+		Str("file", outputFileName).
+		Msg("Writing init segment")
 
 	if _, err := f.Write(initData); err != nil {
 		return fmt.Errorf("failed to write init segment: %w", err)
 	}
-	log.Infof("[downloadSegments] Wrote init segment to %s", outputFileName)
+	log.Info().Str("file", outputFileName).Msg("Wrote init segment")
 
-	// 2) Download all segments in parallel (limit concurrency to v.concurrency)
 	concurrency := v.concurrency
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	log.Debugf("Starting concurrent downloads with concurrency=%d for %s", concurrency, outputFileName)
+	log.Debug().
+		Int("concurrency", concurrency).
+		Str("file", outputFileName).
+		Msg("Starting concurrent downloads")
 
-	results := make([][]byte, len(segmentList)) // each entry is the downloaded bytes for segment i
+	results := make([][]byte, len(segmentList))
 	errorsChan := make(chan error, len(segmentList))
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, concurrency) // concurrency limiter
+	sem := make(chan struct{}, concurrency)
 
 	for idx, seg := range segmentList {
 		wg.Add(1)
 		go func(i int, s Segment) {
 			defer wg.Done()
-			sem <- struct{}{} // acquire concurrency slot
+			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			segURL, errBuild := buildSegmentURL(v.mainBase, s.URL)
@@ -399,40 +384,50 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 				return
 			}
 
-			log.Debugf("Downloading segment idx=%d => %s", i, segURL)
+			log.Debug().
+				Int("index", i).
+				Str("url", segURL).
+				Msg("Downloading segment")
+
 			data, errDl := downloadSegment(segURL)
 			if errDl != nil {
 				errorsChan <- fmt.Errorf("failed to download segment idx %d: %w", i, errDl)
 				return
 			}
 			results[i] = data
-			log.Debugf("Segment idx=%d downloaded, size=%d bytes", i, len(data))
+			log.Debug().
+				Int("index", i).
+				Int("size", len(data)).
+				Msg("Segment downloaded")
 		}(idx, seg)
 	}
 
 	wg.Wait()
 	close(errorsChan)
 
-	// if anything went wrong, return the first error
 	for e := range errorsChan {
 		if e != nil {
 			return e
 		}
 	}
 
-	// 3) Write out segments in ascending order
 	for i, segData := range results {
-		log.Debugf("Writing segment idx=%d to file => length=%d bytes", i, len(segData))
+		log.Debug().
+			Int("index", i).
+			Int("length", len(segData)).
+			Msg("Writing segment to file")
 		if _, err := f.Write(segData); err != nil {
 			return fmt.Errorf("failed writing segment idx %d to file: %w", i, err)
 		}
 	}
 
-	log.Infof("[downloadSegments] Downloaded and concatenated %d segments into %s", len(segmentList), outputFileName)
+	log.Info().
+		Int("segments", len(segmentList)).
+		Str("file", outputFileName).
+		Msg("Downloaded and concatenated segments")
 	return nil
 }
 
-// downloadSegment performs an HTTP GET, returning the entire response body.
 func downloadSegment(segURL string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -441,7 +436,7 @@ func downloadSegment(segURL string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	log.Debugf("downloadSegment => GET %s", segURL)
+	log.Debug().Str("url", segURL).Msg("Downloading segment")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -456,26 +451,16 @@ func downloadSegment(segURL string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// -----------------------------------------------------------------------------
-// main()
-// -----------------------------------------------------------------------------
-
 func main() {
-	// Configure the log output formatter
-	log.SetFormatter(&log.TextFormatter{
-		// Set timestamp format to include milliseconds
-		TimestampFormat: "2006-01-02 15:04:05.000",
-		// Force colored output even when not running in a terminal
-		ForceColors: true,
-		// Show full timestamp in each log entry
-		FullTimestamp: true,
-		// Do not truncate the log level text
-		DisableLevelTruncation: true,
-		// Pad level text for neat columns
-		PadLevelText: true,
-	})
-
-	log.SetLevel(log.DebugLevel)
+	// Configure zerolog
+	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	output := zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: "2006-01-02 15:04:05.000",
+		NoColor:    false,
+	}
+	log.Logger = zerolog.New(output).With().Timestamp().Logger()
 
 	videoIDFlag := flag.String("video-id", "", "Vimeo video ID (optionally with :hash or /hash) e.g. 12345:abcd")
 	playlistURLFlag := flag.String("url", "", "Direct playlist JSON URL (optional)")
@@ -487,137 +472,107 @@ func main() {
 	flag.Parse()
 
 	if *videoIDFlag == "" && *playlistURLFlag == "" {
-		log.Fatal("Either --video <id> or --url <playlistURL> must be provided")
+		log.Fatal().Msg("Either --video <id> or --url <playlistURL> must be provided")
 	}
 
-	// If user gave a direct playlist URL, use it; otherwise auto-resolve from video ID
 	var finalPlaylistURL string
 	if *playlistURLFlag != "" {
 		finalPlaylistURL = *playlistURLFlag
-		//log.Infof("Using direct playlist URL: %s", finalPlaylistURL)
-		log.WithField("url", finalPlaylistURL).Info("Using direct playlist URL")
+
+		log.Info().Str("url", finalPlaylistURL).Msg("Using direct playlist URL")
 	} else {
-		// e.g. "12345:abcd" or "12345/abcd" or just "12345"
+
 		raw := *videoIDFlag
-		//log.Debugf("User-provided video ID or ID+hash => %s", raw)
-		log.WithField("video_id", raw).Debug("Processing video ID")
+
+		log.Debug().Str("video_id", raw).Msg("Processing video ID")
 
 		var forAPI string
 		if strings.Contains(raw, ":") {
-			// user typed 12345:abcd => good
+
 			forAPI = raw
 		} else if strings.Contains(raw, "/") {
-			// user typed 12345/abcd => we want "12345:abcd"
+
 			parts := strings.SplitN(raw, "/", 2)
 			forAPI = parts[0] + ":" + parts[1]
 		} else {
-			// no hash
+
 			forAPI = raw
 		}
-		//log.Debugf("For Vimeo API => %s", forAPI)
-		log.WithField("api_id", forAPI).Debug("Formatted ID for API")
+
+		log.Debug().Str("api_id", forAPI).Msg("Formatted ID for API")
 
 		resolved, err := resolvePlaylistURLFromVideoID(forAPI)
 		if err != nil {
-			log.Fatalf("Could not resolve playlist URL from video ID '%s': %v", raw, err)
+			log.Fatal().Err(err).Str("video_id", raw).Msg("Could not resolve playlist URL")
 		}
 		finalPlaylistURL = resolved
-		log.Infof("Resolved final playlist URL => %s", finalPlaylistURL)
+		log.Info().Str("url", finalPlaylistURL).Msg("Resolved final playlist URL")
 	}
 
-	// Initialize Vimeo struct
 	vimeo := &Vimeo{
 		playlistURL: finalPlaylistURL,
 		outputPath:  *outputFlag,
 		concurrency: *threadsFlag,
 	}
 
-	// 1) Fetch and parse the playlist
-	/* 	if err := vimeo.SendRequest(); err != nil {
-	   		log.Fatalf("Unable to get playlist JSON: %v", err)
-	   	}
-	   	if err := vimeo.ParsePlaylist(); err != nil {
-	   		log.Fatalf("Unable to parse playlist: %v", err)
-	   	} */
-
 	if err := vimeo.SendRequest(); err != nil {
-		log.WithError(err).Fatal("Failed to get playlist JSON")
+		log.Fatal().Err(err).Msg("Failed to get playlist JSON")
 	}
 
 	if err := vimeo.ParsePlaylist(); err != nil {
-		log.WithError(err).Fatal("Failed to parse playlist")
+		log.Fatal().Err(err).Msg("Failed to parse playlist")
 	}
 
-	// 2) Select best video + audio streams
 	bestVideo := vimeo.BestVideoStream()
 	bestAudio := vimeo.BestAudioStream()
 
 	if bestVideo == nil && bestAudio == nil {
-		log.Fatal("No video or audio streams found in the playlist JSON")
+		log.Fatal().Msg("No video or audio streams found in the playlist JSON")
 	}
 
-	// 3) Download the best streams
-	/* 	if bestVideo != nil {
-	   		fileVideo := *videoPath
-	   		log.Infof("Downloading best video => %s", fileVideo)
-	   		err := vimeo.downloadSegments(bestVideo.Segments, bestVideo.InitSegment, fileVideo)
-	   		if err != nil {
-	   			log.Fatalf("Failed to download best video: %v", err)
-	   		}
-	   	}
-	   	if bestAudio != nil {
-	   		fileAudio := *audioPath
-	   		log.Infof("Downloading best audio => %s", fileAudio)
-	   		err := vimeo.downloadSegments(bestAudio.Segments, bestAudio.InitSegment, fileAudio)
-	   		if err != nil {
-	   			log.Fatalf("Failed to download best audio: %v", err)
-	   		}
-	   	} */
-
-	// Download and process streams
 	if bestVideo != nil {
-		log.WithFields(log.Fields{
-			"resolution": fmt.Sprintf("%dx%d", bestVideo.Width, bestVideo.Height),
-			"bitrate":    bestVideo.Bitrate,
-			"output":     *videoPath,
-		}).Info("Downloading video stream")
+		log.Info().
+			Str("resolution", fmt.Sprintf("%dx%d", bestVideo.Width, bestVideo.Height)).
+			Int("bitrate", bestVideo.Bitrate).
+			Str("output", *videoPath).
+			Msg("Downloading video stream")
 
 		if err := vimeo.downloadSegments(bestVideo.Segments, bestVideo.InitSegment, *videoPath); err != nil {
 
-			log.WithError(err).Fatal("Failed to download video stream")
+			log.Fatal().Err(err).Msg("Failed to download video stream")
 		}
 	}
 
 	if bestAudio != nil {
-		log.WithFields(log.Fields{
-			"channels": bestAudio.Channels,
-			"bitrate":  bestAudio.Bitrate,
-			"output":   *audioPath,
-		}).Info("Downloading audio stream")
+		log.Info().
+			Int("channels", bestAudio.Channels).
+			Int("bitrate", bestAudio.Bitrate).
+			Str("output", *audioPath).
+			Msg("Downloading audio stream")
 
 		if err := vimeo.downloadSegments(bestAudio.Segments, bestAudio.InitSegment, *audioPath); err != nil {
 
-			log.WithError(err).Fatal("Failed to download audio stream")
+			log.Fatal().Err(err).Msg("Failed to download audio stream")
 		}
 	}
 
 	// Process MP4 files
 	videoFile, err := os.Open(*videoPath)
 	if err != nil {
-		log.WithError(err).WithField("path", *videoPath).Fatal("Failed to open video file")
+		log.Fatal().Err(err).Str("path", *videoPath).Msg("Failed to open video file")
 	}
 	defer videoFile.Close()
 
 	audioFile, err := os.Open(*audioPath)
 	if err != nil {
-		log.WithError(err).WithField("path", *audioPath).Fatal("Failed to open audio file")
+		log.Fatal().Err(err).Str("path", *audioPath).Msg("Failed to open audio file")
 	}
 	defer audioFile.Close()
 
 	mp4File, err := os.OpenFile(*outPath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
-		log.WithError(err).WithField("path", *outPath).Fatal("Failed to create output MP4 file")
-		//log.Fatalf("Failed to create output MP4 file. %v", err)
+		log.Fatal().Err(err).Str("path", *outPath).Msg("Failed to create output MP4 file")
+
 	}
 	defer mp4File.Close()
 
@@ -625,43 +580,49 @@ func main() {
 	demuxerVideo := mp4.CreateMp4Demuxer(videoFile)
 	videoTracksInfo, err := demuxerVideo.ReadHead()
 	if err != nil {
-		log.WithError(err).Fatal("Failed to read video track info")
-
+		log.Fatal().Err(err).Msg("Failed to read video track info")
 	}
-	log.WithField("tracks_info", fmt.Sprintf("%+v", videoTracksInfo)).Debug("")
-	//fmt.Printf("videoTracksInfo: %+v\n", videoTracksInfo)
+
+	log.Debug().
+		Interface("tracks_info", videoTracksInfo).
+		Msg("Video tracks info")
+
 	mp4VideoInfo := demuxerVideo.GetMp4Info()
-	log.WithField("video_info", fmt.Sprintf("%+v", mp4VideoInfo)).Debug("")
-	//fmt.Printf("mp4VideoInfo: %+v\n", mp4VideoInfo)
+	log.Debug().
+		Interface("video_info", mp4VideoInfo).
+		Msg("MP4 video info")
 
 	demuxerAudio := mp4.CreateMp4Demuxer(audioFile)
 	audioTracksInfo, err := demuxerAudio.ReadHead()
 	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	fmt.Printf("audioTracksInfo: %+v\n", audioTracksInfo)
-	mp4AudioInfo := demuxerVideo.GetMp4Info()
-	fmt.Printf("mp4AudioInfo: %+v\n", mp4AudioInfo)
+		log.Fatal().Err(err).Msg("Failed to read audio track info")
 
-	fmt.Println(mp4File.Seek(0, io.SeekCurrent))
+	}
+
+	log.Debug().
+		Interface("tracks_info", audioTracksInfo).
+		Msg("Audio tracks info")
+
+	mp4AudioInfo := demuxerAudio.GetMp4Info()
+	log.Debug().
+		Interface("audio_info", mp4AudioInfo).
+		Msg("MP4 audio info")
+
 	muxer, err := mp4.CreateMp4Muxer(mp4File)
 	if err != nil {
-		fmt.Println(err)
-		return
+		log.Fatal().Err(err).Msg("Failed to create MP4 muxer")
+
 	}
 
 	vtid := muxer.AddVideoTrack(mp4.MP4_CODEC_TYPE(videoTracksInfo[0].Cid))
 	atid := muxer.AddAudioTrack(mp4.MP4_CODEC_TYPE(audioTracksInfo[0].Cid))
 
-	//fmt.Printf("int64(videoTracksInfo[0].EndDts): %v\n", int64(videoTracksInfo[0].EndDts))
-	// Get video file size for progress bar
-	log.Info("Starting video processing...")
+	log.Info().Msg("Starting video processing...")
 
 	videoStat, _ := videoFile.Stat()
 	ratio := uint64(videoStat.Size()) / videoTracksInfo[0].EndDts
 	videoBar := progressbar.DefaultBytes(
-		//videoStat.Size(),
+
 		int64(videoTracksInfo[0].EndDts*ratio),
 		"Processing video",
 	)
@@ -670,28 +631,24 @@ func main() {
 		pkg, err := demuxerVideo.ReadPacket()
 		if err != nil {
 			if err != io.EOF {
-				log.WithError(err).Error("Error reading video packet")
+				log.Error().Err(err).Msg("Error reading video packet")
 			}
 			break
 		}
-		//percentComplete := (100 * pkg.Dts) / videoTracksInfo[0].EndDts
 
 		if pkg.Cid == videoTracksInfo[0].Cid {
-			//fmt.Printf("track:%d,cid:%+v,pts:%d dts:%d\n", pkg.TrackId, pkg.Cid, pkg.Pts, pkg.Dts)
-			//fmt.Printf("pts:%d dts:%d endDts:%d\n", pkg.Pts, pkg.Dts, videoTracksInfo[0].EndDts)
+
 			if err = muxer.Write(vtid, pkg.Data, uint64(pkg.Pts), uint64(pkg.Dts)); err != nil {
-				log.WithError(err).Fatal("Failed to write video packet")
+				log.Fatal().Err(err).Msg("Failed to write video packet")
 
 			}
-			//videoBar.Add(int(pkg.Dts - pkg.Pts))
+
 			videoBar.Set64(int64(pkg.Dts * ratio))
 
 		}
 	}
 
-	// Get audio file size for progress bar
-
-	log.Info("Starting audio processing...")
+	log.Info().Msg("Starting audio processing...")
 	audioStat, _ := audioFile.Stat()
 	ratio = uint64(audioStat.Size()) / audioTracksInfo[0].EndDts
 	audioBar := progressbar.DefaultBytes(
@@ -703,25 +660,25 @@ func main() {
 		pkg, err := demuxerAudio.ReadPacket()
 		if err != nil {
 			if err != io.EOF {
-				log.WithError(err).Error("Error reading audio packet")
+				log.Error().Err(err).Msg("Error reading audio packet")
 			}
 			break
 		}
 
 		if pkg.Cid == audioTracksInfo[0].Cid {
 			if err = muxer.Write(atid, pkg.Data, uint64(pkg.Pts), uint64(pkg.Dts)); err != nil {
-				log.WithError(err).Fatal("Failed to write audio packet")
+				log.Fatal().Err(err).Msg("Failed to write audio packet")
 
 			}
 			audioBar.Set64(int64(pkg.Dts * ratio))
 		}
 	}
 
-	log.Info("Writing MP4 trailer...")
+	log.Info().Msg("Writing MP4 trailer...")
 	if err = muxer.WriteTrailer(); err != nil {
-		log.WithError(err).Fatal("Failed to write MP4 trailer")
+		log.Fatal().Err(err).Msg("Failed to write MP4 trailer")
 
 	}
 
-	log.WithField("output", *outPath).Info("Processing completed successfully")
+	log.Info().Str("output", *outPath).Msg("Processing completed successfully")
 }
