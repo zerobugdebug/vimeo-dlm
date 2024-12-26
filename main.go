@@ -17,7 +17,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	log "github.com/sirupsen/logrus"
+	"github.com/yapingcat/gomedia/go-mp4"
 )
 
 // Segment represents a media segment in the stream.
@@ -468,13 +470,13 @@ func main() {
 
 	log.SetLevel(log.DebugLevel)
 
-	videoIDFlag := flag.String("video", "", "Vimeo video ID (optionally with :hash or /hash) e.g. 12345:abcd")
+	videoIDFlag := flag.String("video-id", "", "Vimeo video ID (optionally with :hash or /hash) e.g. 12345:abcd")
 	playlistURLFlag := flag.String("url", "", "Direct playlist JSON URL (optional)")
 	outputFlag := flag.String("output", ".", "Output directory")
 	threadsFlag := flag.Int("threads", 6, "Number of threads for segment download (1 = sequential)")
 	videoPath := flag.String("video", "best_video.mp4", "Path to best_video.mp4")
 	audioPath := flag.String("audio", "best_audio.m4a", "Path to best_audio.m4a")
-	//outPath := flag.String("out", "result.mp4", "Path for the merged output file")
+	outPath := flag.String("out", "result.mp4", "Path for the merged output file")
 	flag.Parse()
 
 	if *videoIDFlag == "" && *playlistURLFlag == "" {
@@ -552,6 +554,117 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to download best audio: %v", err)
 		}
+	}
+
+	videoFile, err := os.Open(*videoPath)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer videoFile.Close()
+
+	audioFile, err := os.Open(*audioPath)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer audioFile.Close()
+
+	mp4File, err := os.OpenFile(*outPath, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer mp4File.Close()
+
+	demuxerVideo := mp4.CreateMp4Demuxer(videoFile)
+	videoTracksInfo, err := demuxerVideo.ReadHead()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Printf("videoTracksInfo: %+v\n", videoTracksInfo)
+	mp4VideoInfo := demuxerVideo.GetMp4Info()
+	fmt.Printf("mp4VideoInfo: %+v\n", mp4VideoInfo)
+
+	demuxerAudio := mp4.CreateMp4Demuxer(audioFile)
+	audioTracksInfo, err := demuxerAudio.ReadHead()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	fmt.Printf("audioTracksInfo: %+v\n", audioTracksInfo)
+	mp4AudioInfo := demuxerVideo.GetMp4Info()
+	fmt.Printf("mp4AudioInfo: %+v\n", mp4AudioInfo)
+
+	fmt.Println(mp4File.Seek(0, io.SeekCurrent))
+	muxer, err := mp4.CreateMp4Muxer(mp4File)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	vtid := muxer.AddVideoTrack(mp4.MP4_CODEC_TYPE(videoTracksInfo[0].Cid))
+	atid := muxer.AddAudioTrack(mp4.MP4_CODEC_TYPE(audioTracksInfo[0].Cid))
+
+	fmt.Printf("int64(videoTracksInfo[0].EndDts): %v\n", int64(videoTracksInfo[0].EndDts))
+	// Get video file size for progress bar
+	videoStat, _ := videoFile.Stat()
+	ratio := uint64(videoStat.Size()) / videoTracksInfo[0].EndDts
+	videoBar := progressbar.DefaultBytes(
+		//videoStat.Size(),
+		int64(videoTracksInfo[0].EndDts*ratio),
+		"Processing video",
+	)
+
+	//progressbar.Default()
+	for {
+		pkg, err := demuxerVideo.ReadPacket()
+		if err != nil {
+			//fmt.Println(err)
+			break
+		}
+		//percentComplete := (100 * pkg.Dts) / videoTracksInfo[0].EndDts
+
+		if pkg.Cid == videoTracksInfo[0].Cid {
+			//fmt.Printf("track:%d,cid:%+v,pts:%d dts:%d\n", pkg.TrackId, pkg.Cid, pkg.Pts, pkg.Dts)
+			//fmt.Printf("pts:%d dts:%d endDts:%d\n", pkg.Pts, pkg.Dts, videoTracksInfo[0].EndDts)
+			err = muxer.Write(vtid, pkg.Data, uint64(pkg.Pts), uint64(pkg.Dts))
+			if err != nil {
+				panic(err)
+			}
+			//videoBar.Add(int(pkg.Dts - pkg.Pts))
+			videoBar.Set64(int64(pkg.Dts * ratio))
+
+		}
+	}
+
+	// Get audio file size for progress bar
+	audioStat, _ := audioFile.Stat()
+	ratio = uint64(audioStat.Size()) / audioTracksInfo[0].EndDts
+	audioBar := progressbar.DefaultBytes(
+		int64(audioTracksInfo[0].EndDts*ratio),
+		"Processing audio",
+	)
+
+	for {
+		pkg, err := demuxerAudio.ReadPacket()
+		if err != nil {
+			break
+		}
+		if pkg.Cid == audioTracksInfo[0].Cid {
+			err = muxer.Write(atid, pkg.Data, uint64(pkg.Pts), uint64(pkg.Dts))
+			if err != nil {
+				panic(err)
+			}
+			audioBar.Set64(int64(pkg.Dts * ratio))
+		}
+	}
+
+	fmt.Println("write trailer")
+	err = muxer.WriteTrailer()
+	if err != nil {
+		panic(err)
 	}
 
 	log.Info("All done. The result.mp4 is in your output folder.")
