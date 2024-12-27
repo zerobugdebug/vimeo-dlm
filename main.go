@@ -35,7 +35,7 @@ type VideoStream struct {
 	Width       int       `json:"width"`
 	Height      int       `json:"height"`
 	ID          string    `json:"id"`
-	BaseURL     string    `json:"base_url"`
+	BaseURL     string    `json:"base_url"` // Add this field
 	Bitrate     int       `json:"bitrate"`
 	AvgBitrate  int       `json:"avg_bitrate"`
 	Codecs      string    `json:"codecs"`
@@ -45,7 +45,7 @@ type VideoStream struct {
 
 type AudioStream struct {
 	ID          string    `json:"id"`
-	BaseURL     string    `json:"base_url"`
+	BaseURL     string    `json:"base_url"` // Add this field
 	Bitrate     int       `json:"bitrate"`
 	Channels    int       `json:"channels"`
 	SampleRate  int       `json:"sample_rate"`
@@ -409,17 +409,28 @@ func (v *Vimeo) BestAudioStream() *AudioStream {
 	return best
 }
 
-func buildSegmentURL(base, segURL string) (string, error) {
+func buildSegmentURL(mainBase, childBase, segURL string) (string, error) {
 	log.Trace().
-		Str("base", base).
+		Str("main_base", mainBase).
+		Str("child_base", childBase).
 		Str("segment_url", segURL).
 		Msg("Entering buildSegmentURL()")
 	defer log.Trace().Msg("Exiting buildSegmentURL()")
 
-	segBase, err := url.Parse(base)
+	segBase, err := url.Parse(mainBase)
 	if err != nil {
-		log.Error().Err(err).Str("base", base).Msg("Failed to parse base URL")
-		return "", fmt.Errorf("failed to parse base URL: %w", err)
+		log.Error().Err(err).Str("base", mainBase).Msg("Failed to parse main base URL")
+		return "", fmt.Errorf("failed to parse main base URL: %w", err)
+	}
+
+	// If child base URL exists, append it to the main base
+	if childBase != "" {
+		childRef, err := url.Parse(childBase)
+		if err != nil {
+			log.Error().Err(err).Str("child_base", childBase).Msg("Failed to parse child base URL")
+			return "", fmt.Errorf("failed to parse child base URL: %w", err)
+		}
+		segBase = segBase.ResolveReference(childRef)
 	}
 
 	ref, err := url.Parse(segURL)
@@ -430,17 +441,18 @@ func buildSegmentURL(base, segURL string) (string, error) {
 
 	resolved := segBase.ResolveReference(ref).String()
 	log.Debug().
-		Str("base", base).
+		Str("main_base", mainBase).
+		Str("child_base", childBase).
 		Str("segment", segURL).
 		Str("resolved", resolved).
 		Msg("Segment URL resolved")
 
 	return resolved, nil
 }
-
-func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outputFileName string) error {
+func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, childBase string, outputFileName string) error {
 	log.Trace().
 		Int("segments", len(segmentList)).
+		Str("child_base", childBase).
 		Str("output", outputFileName).
 		Msg("Entering downloadSegments()")
 	defer log.Trace().Msg("Exiting downloadSegments()")
@@ -519,7 +531,7 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 				Float64("end", s.End).
 				Msg("Processing segment")
 
-			segURL, errBuild := buildSegmentURL(v.mainBase, s.URL)
+			segURL, errBuild := buildSegmentURL(v.mainBase, childBase, s.URL)
 			if errBuild != nil {
 				log.Error().Err(errBuild).Int("index", i).Msg("Failed to build segment URL")
 				errorsChan <- fmt.Errorf("failed to build segment URL for idx %d: %w", i, errBuild)
@@ -761,8 +773,7 @@ func main() {
 			Str("output", *videoPath).
 			Msg("Downloading video stream")
 
-		if err := vimeo.downloadSegments(bestVideo.Segments, bestVideo.InitSegment, *videoPath); err != nil {
-
+		if err := vimeo.downloadSegments(bestVideo.Segments, bestVideo.InitSegment, bestVideo.BaseURL, *videoPath); err != nil {
 			log.Fatal().Err(err).Msg("Failed to download video stream")
 		}
 	}
@@ -775,8 +786,7 @@ func main() {
 			Str("output", *audioPath).
 			Msg("Downloading audio stream")
 
-		if err := vimeo.downloadSegments(bestAudio.Segments, bestAudio.InitSegment, *audioPath); err != nil {
-
+		if err := vimeo.downloadSegments(bestAudio.Segments, bestAudio.InitSegment, bestAudio.BaseURL, *audioPath); err != nil {
 			log.Fatal().Err(err).Msg("Failed to download audio stream")
 		}
 	}
