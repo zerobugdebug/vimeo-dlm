@@ -640,18 +640,7 @@ func downloadSegment(segURL string) ([]byte, error) {
 }
 
 func main() {
-	// Configure zerolog
-	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
-	zerolog.SetGlobalLevel(zerolog.InfoLevel) // Changed from DebugLevel to TraceLevel
-	output := zerolog.ConsoleWriter{
-		Out:        os.Stdout,
-		TimeFormat: "2006-01-02 15:04:05.000",
-		NoColor:    false,
-	}
-	log.Logger = zerolog.New(output).With().Timestamp().Logger()
-
-	log.Trace().Msg("Starting application...")
-
+	logLevelFlag := flag.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal)")
 	videoIDFlag := flag.String("video-id", "", "Vimeo video ID (optionally with :hash or /hash) e.g. 12345:abcd")
 	playlistURLFlag := flag.String("url", "", "Direct playlist JSON URL (optional)")
 	outputFlag := flag.String("output", ".", "Output directory")
@@ -661,6 +650,23 @@ func main() {
 	outPath := flag.String("out", "result.mp4", "Path for the merged output file")
 
 	flag.Parse()
+
+	// Set log level based on flag
+	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
+	logLevel, err := zerolog.ParseLevel(*logLevelFlag)
+	if err != nil {
+		log.Fatal().Err(err).Str("level", *logLevelFlag).Msg("Invalid log level specified")
+	}
+	zerolog.SetGlobalLevel(logLevel)
+
+	output := zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: "2006-01-02 15:04:05.000",
+		NoColor:    false,
+	}
+	log.Logger = zerolog.New(output).With().Timestamp().Logger()
+
+	log.Trace().Msg("Starting application...")
 
 	log.Debug().
 		Str("video_id", *videoIDFlag).
