@@ -502,9 +502,19 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, child
 	errorsChan := make(chan error, len(segmentList))
 
 	// Create progress bar for downloads
-	bar := progressbar.Default(
+	/* 	bar := progressbar.Default(
 		int64(len(segmentList)),
 		fmt.Sprintf("Downloading %s", outputFileName),
+	) */
+
+	bar := progressbar.NewOptions64(int64(len(segmentList)),
+		progressbar.OptionSetDescription(fmt.Sprintf("Downloading %s", outputFileName)),
+		progressbar.OptionSetItsString("seg"),
+		progressbar.OptionSetPredictTime(true),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionShowIts(),
+		progressbar.OptionUseANSICodes(true),
+		progressbar.OptionShowCount(),
 	)
 
 	var wg sync.WaitGroup
@@ -653,13 +663,12 @@ func downloadSegment(segURL string) ([]byte, error) {
 
 func main() {
 	logLevelFlag := flag.String("log-level", "info", "Log level (trace, debug, info, warn, error, fatal)")
-	videoIDFlag := flag.String("video-id", "", "Vimeo video ID (optionally with :hash or /hash) e.g. 12345:abcd")
+	videoIDFlag := flag.String("video", "", "Vimeo video ID (optionally with :hash or /hash) e.g. 12345:abcd")
 	playlistURLFlag := flag.String("url", "", "Direct playlist JSON URL (optional)")
-	outputFlag := flag.String("output", ".", "Output directory")
+	tempDirFlag := flag.String("temp-dir", ".", "Directory for temporary files")
 	threadsFlag := flag.Int("threads", 4, "Number of threads for segment download (1 = sequential)")
-	videoPath := flag.String("video", "best_video.mp4", "Path to best_video.mp4")
-	audioPath := flag.String("audio", "best_audio.m4a", "Path to best_audio.m4a")
-	outPath := flag.String("out", "result.mp4", "Path for the merged output file")
+	outDirFlag := flag.String("out-dir", ".", "Output directory for the final merged file")
+	keepTempFlag := flag.Bool("keep-temp", false, "Keep temporary files after processing")
 
 	flag.Parse()
 
@@ -683,15 +692,19 @@ func main() {
 	log.Debug().
 		Str("video_id", *videoIDFlag).
 		Str("playlist_url", *playlistURLFlag).
-		Str("output_dir", *outputFlag).
+		Str("temp_dir", *tempDirFlag).
 		Int("threads", *threadsFlag).
-		Str("video_path", *videoPath).
-		Str("audio_path", *audioPath).
-		Str("out_path", *outPath).
+		Str("out_dir", *outDirFlag).
+		Bool("keep_temp", *keepTempFlag).
 		Msg("Parsed command line flags")
 
 	if *videoIDFlag == "" && *playlistURLFlag == "" {
 		log.Fatal().Msg("Either --video <id> or --url <playlistURL> must be provided")
+	}
+
+	// Create output directory if it doesn't exist
+	if err := os.MkdirAll(*outDirFlag, 0755); err != nil {
+		log.Fatal().Err(err).Str("path", *outDirFlag).Msg("Failed to create output directory")
 	}
 
 	var finalPlaylistURL, videoTitle string
@@ -734,19 +747,13 @@ func main() {
 			Str("title", videoTitle).
 			Msg("Resolved final playlist URL and title")
 	}
-	if *videoPath == "best_video.mp4" {
-		*videoPath = videoTitle + "_video.mp4"
-	}
-	if *audioPath == "best_audio.m4a" {
-		*audioPath = videoTitle + "_audio.m4a"
-	}
-	if *outPath == "result.mp4" {
-		*outPath = videoTitle + ".mp4"
-	}
+	// Define temporary file paths
+	tempVideoPath := filepath.Join(*tempDirFlag, videoTitle+"_video.mp4")
+	tempAudioPath := filepath.Join(*tempDirFlag, videoTitle+"_audio.m4a")
 
 	vimeo := &Vimeo{
 		playlistURL: finalPlaylistURL,
-		outputPath:  *outputFlag,
+		outputPath:  *tempDirFlag, // Use tempDirFlag for temporary files
 		concurrency: *threadsFlag,
 	}
 
@@ -770,10 +777,10 @@ func main() {
 			Str("resolution", fmt.Sprintf("%dx%d", bestVideo.Width, bestVideo.Height)).
 			Int("bitrate", bestVideo.Bitrate).
 			Int("segments", len(bestVideo.Segments)).
-			Str("output", *videoPath).
+			Str("output", tempVideoPath).
 			Msg("Downloading video stream")
 
-		if err := vimeo.downloadSegments(bestVideo.Segments, bestVideo.InitSegment, bestVideo.BaseURL, *videoPath); err != nil {
+		if err := vimeo.downloadSegments(bestVideo.Segments, bestVideo.InitSegment, bestVideo.BaseURL, tempVideoPath); err != nil {
 			log.Fatal().Err(err).Msg("Failed to download video stream")
 		}
 	}
@@ -783,10 +790,10 @@ func main() {
 			Int("channels", bestAudio.Channels).
 			Int("bitrate", bestAudio.Bitrate).
 			Int("segments", len(bestAudio.Segments)).
-			Str("output", *audioPath).
+			Str("output", tempAudioPath).
 			Msg("Downloading audio stream")
 
-		if err := vimeo.downloadSegments(bestAudio.Segments, bestAudio.InitSegment, bestAudio.BaseURL, *audioPath); err != nil {
+		if err := vimeo.downloadSegments(bestAudio.Segments, bestAudio.InitSegment, bestAudio.BaseURL, tempAudioPath); err != nil {
 			log.Fatal().Err(err).Msg("Failed to download audio stream")
 		}
 	}
@@ -794,22 +801,24 @@ func main() {
 	// Process MP4 files
 	log.Debug().Msg("Opening video and audio files for processing")
 
-	videoFile, err := os.Open(*videoPath)
+	videoFile, err := os.Open(tempVideoPath)
 	if err != nil {
-		log.Fatal().Err(err).Str("path", *videoPath).Msg("Failed to open video file")
+		log.Fatal().Err(err).Str("path", tempVideoPath).Msg("Failed to open video file")
 	}
 	defer videoFile.Close()
 
-	audioFile, err := os.Open(*audioPath)
+	audioFile, err := os.Open(tempAudioPath)
 	if err != nil {
-		log.Fatal().Err(err).Str("path", *audioPath).Msg("Failed to open audio file")
+		log.Fatal().Err(err).Str("path", tempAudioPath).Msg("Failed to open audio file")
 	}
 	defer audioFile.Close()
 
-	mp4File, err := os.OpenFile(*outPath, os.O_CREATE|os.O_RDWR, 0666)
-	if err != nil {
-		log.Fatal().Err(err).Str("path", *outPath).Msg("Failed to create output MP4 file")
+	// Prepare output file path
+	outputPath := filepath.Join(*outDirFlag, videoTitle+".mp4")
 
+	mp4File, err := os.OpenFile(outputPath, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		log.Fatal().Err(err).Str("path", outputPath).Msg("Failed to create output MP4 file")
 	}
 	defer mp4File.Close()
 
@@ -948,7 +957,18 @@ func main() {
 
 	}
 
+	// Cleanup temporary files if not keeping them
+	if !*keepTempFlag {
+		log.Info().Msg("Cleaning up temporary files...")
+		if err := os.Remove(tempVideoPath); err != nil {
+			log.Warn().Err(err).Str("path", tempVideoPath).Msg("Failed to remove temporary video file")
+		}
+		if err := os.Remove(tempAudioPath); err != nil {
+			log.Warn().Err(err).Str("path", tempAudioPath).Msg("Failed to remove temporary audio file")
+		}
+	}
+
 	log.Info().
-		Str("output", *outPath).
+		Str("output", outputPath).
 		Msg("Processing completed successfully")
 }
