@@ -655,7 +655,7 @@ func main() {
 	videoIDFlag := flag.String("video-id", "", "Vimeo video ID (optionally with :hash or /hash) e.g. 12345:abcd")
 	playlistURLFlag := flag.String("url", "", "Direct playlist JSON URL (optional)")
 	outputFlag := flag.String("output", ".", "Output directory")
-	threadsFlag := flag.Int("threads", 6, "Number of threads for segment download (1 = sequential)")
+	threadsFlag := flag.Int("threads", 4, "Number of threads for segment download (1 = sequential)")
 	videoPath := flag.String("video", "best_video.mp4", "Path to best_video.mp4")
 	audioPath := flag.String("audio", "best_audio.m4a", "Path to best_audio.m4a")
 	outPath := flag.String("out", "result.mp4", "Path for the merged output file")
@@ -751,6 +751,7 @@ func main() {
 		log.Info().
 			Str("resolution", fmt.Sprintf("%dx%d", bestVideo.Width, bestVideo.Height)).
 			Int("bitrate", bestVideo.Bitrate).
+			Int("segments", len(bestVideo.Segments)).
 			Str("output", *videoPath).
 			Msg("Downloading video stream")
 
@@ -764,6 +765,7 @@ func main() {
 		log.Info().
 			Int("channels", bestAudio.Channels).
 			Int("bitrate", bestAudio.Bitrate).
+			Int("segments", len(bestAudio.Segments)).
 			Str("output", *audioPath).
 			Msg("Downloading audio stream")
 
