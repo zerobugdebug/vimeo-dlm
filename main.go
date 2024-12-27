@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -156,28 +157,28 @@ func fetchVimeoConfigURL(ctx context.Context, videoID, jwt string) (string, erro
 	return data.ConfigURL, nil
 }
 
-func fetchAVCPlaylistURL(ctx context.Context, configURL string) (string, error) {
+func fetchAVCPlaylistURL(ctx context.Context, configURL string) (string, string, error) {
 	log.Trace().Str("configURL", configURL).Msg("Entering fetchAVCPlaylistURL()")
 	defer log.Trace().Msg("Exiting fetchAVCPlaylistURL()")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, configURL, nil)
 	if err != nil {
 		log.Error().Err(err).Str("url", configURL).Msg("Failed to create AVC playlist request")
-		return "", fmt.Errorf("failed to build configURL request: %w", err)
+		return "", "", fmt.Errorf("failed to build configURL request: %w", err)
 	}
 
 	log.Debug().Interface("headers", req.Header).Msg("Request headers set")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Error().Err(err).Str("url", configURL).Msg("Failed to execute AVC playlist request")
-		return "", fmt.Errorf("failed to request configURL: %w", err)
+		return "", "", fmt.Errorf("failed to request configURL: %w", err)
 	}
 	defer resp.Body.Close()
 
 	log.Debug().Int("status_code", resp.StatusCode).Msg("Received response")
 	if resp.StatusCode != http.StatusOK {
 		log.Error().Int("status_code", resp.StatusCode).Msg("Unexpected status code for AVC playlist")
-		return "", fmt.Errorf("unexpected HTTP status from config_url: %d", resp.StatusCode)
+		return "", "", fmt.Errorf("unexpected HTTP status from config_url: %d", resp.StatusCode)
 	}
 
 	var data struct {
@@ -191,11 +192,14 @@ func fetchAVCPlaylistURL(ctx context.Context, configURL string) (string, error) 
 				} `json:"dash"`
 			} `json:"files"`
 		} `json:"request"`
+		Video struct {
+			Title string `json:"title"`
+		} `json:"video"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		log.Error().Err(err).Msg("Failed to decode AVC playlist response")
-		return "", fmt.Errorf("failed to parse config JSON: %w", err)
+		return "", "", fmt.Errorf("failed to parse config JSON: %w", err)
 	}
 
 	defaultCDN := data.Request.Files.Dash.DefaultCDN
@@ -203,25 +207,49 @@ func fetchAVCPlaylistURL(ctx context.Context, configURL string) (string, error) 
 
 	if defaultCDN == "" {
 		log.Error().Msg("Default CDN not found in config")
-		return "", errors.New("default_cdn not found in config")
+		return "", "", errors.New("default_cdn not found in config")
 	}
 
 	cdn, ok := data.Request.Files.Dash.CDNs[defaultCDN]
 	if !ok {
 		log.Error().Str("cdn", defaultCDN).Msg("CDN not found in dash.cdns")
-		return "", fmt.Errorf("CDN '%s' not found in dash.cdns", defaultCDN)
+		return "", "", fmt.Errorf("CDN '%s' not found in dash.cdns", defaultCDN)
 	}
 
 	if cdn.AVCURL == "" {
 		log.Error().Msg("AVC URL not found in config")
-		return "", errors.New("avc_url not found in config")
+		return "", "", errors.New("avc_url not found in config")
 	}
 
-	log.Debug().Str("avc_url", cdn.AVCURL).Msg("AVC URL successfully retrieved")
-	return cdn.AVCURL, nil
+	// Clean the title for use as filename
+	title := sanitizeFilename(data.Video.Title)
+	if title == "" {
+		title = "vimeo_video" // fallback name
+	}
+
+	log.Debug().
+		Str("avc_url", cdn.AVCURL).
+		Str("title", title).
+		Msg("AVC URL and title successfully retrieved")
+	return cdn.AVCURL, title, nil
 }
 
-func resolvePlaylistURLFromVideoID(videoID string) (string, error) {
+// sanitizeFilename removes or replaces characters that are invalid in filenames
+func sanitizeFilename(name string) string {
+	// Replace invalid characters with underscores
+	invalid := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
+	name = invalid.ReplaceAllString(name, "_")
+
+	// Trim spaces from ends
+	name = strings.TrimSpace(name)
+
+	// Replace multiple spaces/underscores with single underscore
+	name = regexp.MustCompile(`[\s_]+`).ReplaceAllString(name, "_")
+
+	return name
+}
+
+func resolvePlaylistURLFromVideoID(videoID string) (string, string, error) {
 	log.Trace().Str("videoID", videoID).Msg("Entering resolvePlaylistURLFromVideoID()")
 	defer log.Trace().Msg("Exiting resolvePlaylistURLFromVideoID()")
 
@@ -231,23 +259,26 @@ func resolvePlaylistURLFromVideoID(videoID string) (string, error) {
 	log.Debug().Msg("Fetching Vimeo JWT...")
 	jwt, err := fetchVimeoJWT(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch Vimeo JWT: %w", err)
+		return "", "", fmt.Errorf("failed to fetch Vimeo JWT: %w", err)
 	}
 
 	log.Debug().Msg("Fetching config URL...")
 	configURL, err := fetchVimeoConfigURL(ctx, videoID, jwt)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch config_url: %w", err)
+		return "", "", fmt.Errorf("failed to fetch config_url: %w", err)
 	}
 
 	log.Debug().Msg("Fetching AVC URL...")
-	avcURL, err := fetchAVCPlaylistURL(ctx, configURL)
+	avcURL, title, err := fetchAVCPlaylistURL(ctx, configURL)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch avc_url: %w", err)
+		return "", "", fmt.Errorf("failed to fetch avc_url: %w", err)
 	}
 
-	log.Debug().Str("avc_url", avcURL).Msg("Successfully resolved playlist URL")
-	return avcURL, nil
+	log.Debug().
+		Str("avc_url", avcURL).
+		Str("title", title).
+		Msg("Successfully resolved playlist URL and title")
+	return avcURL, title, nil
 }
 
 func (v *Vimeo) SendRequest() error {
@@ -458,8 +489,22 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 	results := make([][]byte, len(segmentList))
 	errorsChan := make(chan error, len(segmentList))
 
+	// Create progress bar for downloads
+	bar := progressbar.Default(
+		int64(len(segmentList)),
+		fmt.Sprintf("Downloading %s", outputFileName),
+	)
+
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, concurrency)
+	progressChan := make(chan struct{}, len(segmentList))
+
+	// Start progress monitoring goroutine
+	go func() {
+		for range progressChan {
+			bar.Add(1)
+		}
+	}()
 
 	for idx, seg := range segmentList {
 		wg.Add(1)
@@ -489,6 +534,8 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 			}
 
 			results[i] = data
+			progressChan <- struct{}{} // Signal progress
+
 			log.Debug().
 				Int("index", i).
 				Int("size", len(data)).
@@ -498,7 +545,10 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 	}
 
 	wg.Wait()
+	close(progressChan)
 	close(errorsChan)
+
+	bar.Finish()
 
 	for e := range errorsChan {
 		if e != nil {
@@ -506,6 +556,12 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 			return e
 		}
 	}
+
+	// Create progress bar for writing segments to file
+	writeBar := progressbar.DefaultBytes(
+		getTotalSize(results),
+		"Writing segments to file",
+	)
 
 	for i, segData := range results {
 		log.Trace().
@@ -517,6 +573,7 @@ func (v *Vimeo) downloadSegments(segmentList []Segment, initBase64 string, outpu
 			log.Error().Err(err).Int("index", i).Msg("Failed writing segment to file")
 			return fmt.Errorf("failed writing segment idx %d to file: %w", i, err)
 		}
+		writeBar.Add(len(segData))
 	}
 
 	log.Info().
@@ -585,7 +642,7 @@ func downloadSegment(segURL string) ([]byte, error) {
 func main() {
 	// Configure zerolog
 	zerolog.TimeFieldFormat = "2006-01-02 15:04:05.000"
-	zerolog.SetGlobalLevel(zerolog.DebugLevel) // Changed from DebugLevel to TraceLevel
+	zerolog.SetGlobalLevel(zerolog.InfoLevel) // Changed from DebugLevel to TraceLevel
 	output := zerolog.ConsoleWriter{
 		Out:        os.Stdout,
 		TimeFormat: "2006-01-02 15:04:05.000",
@@ -619,10 +676,10 @@ func main() {
 		log.Fatal().Msg("Either --video <id> or --url <playlistURL> must be provided")
 	}
 
-	var finalPlaylistURL string
+	var finalPlaylistURL, videoTitle string
 	if *playlistURLFlag != "" {
 		finalPlaylistURL = *playlistURLFlag
-
+		videoTitle = "vimeo_video" // Default title for direct URL mode
 		log.Info().Str("url", finalPlaylistURL).Msg("Using direct playlist URL")
 	} else {
 
@@ -648,12 +705,25 @@ func main() {
 			Str("api_id", forAPI).
 			Msg("Formatted ID for API")
 
-		resolved, err := resolvePlaylistURLFromVideoID(forAPI)
+		resolved, title, err := resolvePlaylistURLFromVideoID(forAPI)
 		if err != nil {
 			log.Fatal().Err(err).Str("video_id", raw).Msg("Could not resolve playlist URL")
 		}
 		finalPlaylistURL = resolved
-		log.Info().Str("url", finalPlaylistURL).Msg("Resolved final playlist URL")
+		videoTitle = title
+		log.Info().
+			Str("url", finalPlaylistURL).
+			Str("title", videoTitle).
+			Msg("Resolved final playlist URL and title")
+	}
+	if *videoPath == "best_video.mp4" {
+		*videoPath = videoTitle + "_video.mp4"
+	}
+	if *audioPath == "best_audio.m4a" {
+		*audioPath = videoTitle + "_audio.m4a"
+	}
+	if *outPath == "result.mp4" {
+		*outPath = videoTitle + ".mp4"
 	}
 
 	vimeo := &Vimeo{
